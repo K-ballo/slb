@@ -158,6 +158,7 @@ matrix:
 branches:
   only:
     - master
+    - function
 
 install:
   - |

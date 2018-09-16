@@ -45,6 +45,7 @@ environment:
 branches:
   only:
     - master
+    - function
 
 init:
   - ps: |

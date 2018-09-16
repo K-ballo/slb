@@ -57,4 +57,20 @@
 #define SLB_CXX17_INLINE_VARIABLE
 #endif
 
+// P0091: "Template argument deduction for class templates"
+#if (defined(__cpp_deduction_guides) && __cpp_deduction_guides >= 201606) ||   \
+    (defined(_MSC_VER) && _MSC_VER >= 1914 && _HAS_CXX17)
+#define SLB_HAS_CXX17_DEDUCTION_GUIDES 1
+#else
+#define SLB_HAS_CXX17_DEDUCTION_GUIDES 0
+#endif
+
+#if (defined(__cpp_rtti) && __cpp_rtti >= 199711) ||                           \
+    (defined(__GNUC__) && defined(__GXX_RTTI)) ||                              \
+    (defined(_MSC_VER) && defined(_CPPRTTI))
+#define SLB_HAS_CXX98_RTTI 1
+#else
+#define SLB_HAS_CXX98_RTTI 0
+#endif
+
 #endif // SLB_DETAIL_CONFIG_HPP

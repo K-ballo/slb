@@ -10,6 +10,7 @@ add_library(Catch2 OBJECT catch.cpp)
 
 set(_tests
   functional/bind
+  functional/function
   functional/invoke
   functional/mem_fn
   functional/not_fn
@@ -26,7 +27,7 @@ foreach(_test ${_tests})
 
   file(STRINGS ${_test_file} _lines)
   foreach(_line ${_lines})
-    if(_line MATCHES "^TEST_CASE\\(\"([A-Za-z_0-9()-]+)\"")
+    if(_line MATCHES "^TEST_CASE\\(\"([^\"]+)\"")
       set(_case ${CMAKE_MATCH_1})
       string(MAKE_C_IDENTIFIER ${_case} _case_id)
 

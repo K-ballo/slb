@@ -110,9 +110,6 @@ namespace std {
   template<class R, class... ArgTypes> class function<R(ArgTypes...)>;
 
   template<class R, class... ArgTypes>
-    void swap(function<R(ArgTypes...)>&, function<R(ArgTypes...)>&) noexcept;
-
-  template<class R, class... ArgTypes>
     bool operator==(const function<R(ArgTypes...)>&, nullptr_t) noexcept;
   template<class R, class... ArgTypes>
     bool operator==(nullptr_t, const function<R(ArgTypes...)>&) noexcept;
@@ -120,6 +117,9 @@ namespace std {
     bool operator!=(const function<R(ArgTypes...)>&, nullptr_t) noexcept;
   template<class R, class... ArgTypes>
     bool operator!=(nullptr_t, const function<R(ArgTypes...)>&) noexcept;
+
+  template<class R, class... ArgTypes>
+    void swap(function<R(ArgTypes...)>&, function<R(ArgTypes...)>&) noexcept;
 
   // [func.search], searchers
   template<class ForwardIterator, class BinaryPredicate = equal_to<>>
@@ -150,8 +150,13 @@ namespace std {
 
 */
 
+#include <cassert>
+#include <cstddef>
 #include <functional>
+#include <memory>
+#include <new>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 
 #include "detail/config.hpp"
@@ -381,6 +386,446 @@ typename detail::mem_fn_result<T C::*>::type mem_fn(T C::*pm) noexcept {
   return pm;
 }
 #endif
+
+// [func.wrap], polymorphic function wrappers
+using std::bad_function_call;
+
+template <typename>
+class function; // not defined
+
+namespace detail {
+union function_storage {
+  void* obj_ptr;
+  void (*fun_ptr)();
+  struct incomplete;
+  void (incomplete::*mem_ptr)();
+};
+
+template <typename T>
+union function_embedded_storage {
+  T value;
+  function_storage _;
+};
+
+template <typename T>
+struct function_is_embedded
+    : std::integral_constant<
+          bool,
+          sizeof(T) <= sizeof(function_storage) &&
+              alignof(function_storage) % alignof(T) == 0 &&
+              std::is_move_constructible<function_embedded_storage<T>>::value &&
+              std::is_destructible<function_embedded_storage<T>>::value> {};
+
+template <typename T, typename F>
+static void function_construct(function_storage& storage, F&& f) noexcept(
+    function_is_embedded<T>::value&&
+        std::is_nothrow_constructible<T, F>::value) {
+  if (function_is_embedded<T>::value) {
+    ::new (static_cast<void*>(&storage)) T(std::forward<F>(f));
+  } else {
+    storage.obj_ptr = new T(std::forward<F>(f));
+  }
+}
+
+template <typename T>
+static void function_move(function_storage& storage, T& f) noexcept {
+  if (function_is_embedded<T>::value) {
+    ::new (static_cast<void*>(&storage)) T(std::move(f));
+    f.~T();
+  } else {
+    storage.obj_ptr = std::addressof(f);
+  }
+}
+
+template <typename T>
+static void function_destroy(function_storage& storage) noexcept {
+  if (function_is_embedded<T>::value) {
+    reinterpret_cast<T*>(&storage)->~T();
+  } else {
+    delete static_cast<T*>(storage.obj_ptr);
+  }
+}
+
+template <typename T>
+static T& function_get(function_storage& storage) noexcept {
+  if (function_is_embedded<T>::value) {
+    return *reinterpret_cast<T*>(&storage);
+  } else {
+    return *static_cast<T*>(storage.obj_ptr);
+  }
+}
+
+enum class function_action {
+  get = 1,
+  copy = 2,
+  move = 3,
+  destroy = 4,
+  type_id = 5,
+};
+
+template <typename T>
+inline void* function_manage(function_storage& storage,
+                             function_action action,
+                             function_storage* source = nullptr) {
+  switch (action) {
+  case function_action::get:
+    return std::addressof(function_get<T>(storage));
+  case function_action::copy:
+    return function_construct<T>(storage, function_get<T const>(*source)),
+           nullptr;
+  case function_action::move:
+    return function_move<T>(storage, function_get<T>(*source)), nullptr;
+  case function_action::destroy:
+    return function_destroy<T>(storage), nullptr;
+#if SLB_HAS_CXX98_RTTI
+  case function_action::type_id:
+    return const_cast<std::type_info*>(&typeid(T));
+#endif
+  }
+  return assert(false), nullptr;
+}
+
+template <typename T, typename R, typename... ArgTypes>
+static R
+function_invoke(function_storage& storage, ArgTypes&&... args) noexcept(
+    slb::is_nothrow_invocable_r<R, T&, ArgTypes...>::value) {
+  T& obj = function_get<T>(storage);
+  return detail::invoke_r<R>(obj, std::forward<ArgTypes>(args)...);
+}
+
+template <typename R, typename... ArgTypes>
+static R throw_bad_function_call(function_storage& /*storage*/,
+                                 ArgTypes&&... /*args*/) {
+  throw std::bad_function_call();
+}
+
+template <typename T>
+static bool function_is_empty(T&) noexcept {
+  return false;
+}
+template <typename R, typename... ArgTypes>
+static bool function_is_empty(R (*&ptr)(ArgTypes...)) noexcept {
+  return ptr == nullptr;
+}
+template <typename R, typename C>
+static bool function_is_empty(R C::*& mem_ptr) noexcept {
+  return mem_ptr == nullptr;
+}
+template <typename T>
+static bool function_is_empty(std::function<T>& f) noexcept {
+  return !f;
+}
+} // namespace detail
+
+template <typename R, typename... ArgTypes>
+class function<R(ArgTypes...)> {
+public:
+  using result_type = R;
+
+  // [func.wrap.func.con], construct/copy/destroy
+  function() noexcept
+      : _manage(nullptr),
+        _invoke(&detail::throw_bad_function_call<R, ArgTypes...>) {}
+
+  function(std::nullptr_t) noexcept
+      : _manage(nullptr),
+        _invoke(&detail::throw_bad_function_call<R, ArgTypes...>) {}
+
+  function(function const& f) : _manage(f._manage), _invoke(f._invoke) {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::copy, &f._storage);
+    }
+  }
+
+  function(function&& f) noexcept : _manage(f._manage), _invoke(f._invoke) {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::move, &f._storage);
+    }
+    f._manage = nullptr;
+    f._invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+  }
+
+  template <typename FD,
+            typename Enable = decltype((void)(detail::invoke_r<R>(
+                std::declval<FD&>(), std::declval<ArgTypes>()...)))>
+  function(FD f) noexcept(detail::function_is_embedded<FD>::value&&
+                              std::is_nothrow_move_constructible<FD>::value) {
+    if (!detail::function_is_empty(f)) {
+      detail::function_construct<FD>(_storage, std::move(f));
+      _manage = &detail::function_manage<FD>;
+      _invoke = &detail::function_invoke<FD, R, ArgTypes...>;
+    } else {
+      _manage = nullptr;
+      _invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+    }
+  }
+
+  function& operator=(function const& f) {
+    if (f._manage != nullptr) {
+      detail::function_storage temp_storage;
+      f._manage(temp_storage, detail::function_action::copy, &f._storage);
+
+      if (_manage != nullptr) {
+        _manage(_storage, detail::function_action::destroy, nullptr);
+      }
+      _manage = f._manage;
+      _invoke = f._invoke;
+      _manage(_storage, detail::function_action::move, &temp_storage);
+    } else if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+      _manage = nullptr;
+      _invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+    }
+    return *this;
+  }
+
+  function& operator=(function&& f) noexcept {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+    }
+    _manage = f._manage;
+    _invoke = f._invoke;
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::move, &f._storage);
+    }
+    f._manage = nullptr;
+    f._invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+    return *this;
+  }
+
+  function& operator=(std::nullptr_t) noexcept {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+    }
+    _manage = nullptr;
+    _invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+    return *this;
+  }
+
+  template <typename F,
+            typename FD = typename detail::lib::remove_cvref<F>::type,
+            typename Enable = decltype((void)(detail::invoke_r<R>(
+                std::declval<FD&>(), std::declval<ArgTypes>()...)))>
+  function&
+  operator=(F&& f) noexcept(detail::function_is_embedded<FD>::value&&
+                                std::is_nothrow_constructible<FD, F>::value) {
+    if (!detail::function_is_empty(f)) {
+      if (std::is_nothrow_constructible<FD, F>::value) {
+        if (_manage != nullptr) {
+          _manage(_storage, detail::function_action::destroy, nullptr);
+        }
+        detail::function_construct<FD>(_storage, std::forward<F>(f));
+        _manage = &detail::function_manage<FD>;
+        _invoke = &detail::function_invoke<FD, R, ArgTypes...>;
+      } else {
+        detail::function_storage temp_storage;
+        detail::function_construct<FD>(temp_storage, std::forward<F>(f));
+
+        if (_manage != nullptr) {
+          _manage(_storage, detail::function_action::destroy, nullptr);
+        }
+        _manage = &detail::function_manage<FD>;
+        _invoke = &detail::function_invoke<FD, R, ArgTypes...>;
+        _manage(_storage, detail::function_action::move, &temp_storage);
+      }
+    } else if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+      _manage = nullptr;
+      _invoke = &detail::throw_bad_function_call<R, ArgTypes...>;
+    }
+    return *this;
+  }
+
+  template <typename F, typename FD = std::reference_wrapper<F>>
+  function& operator=(std::reference_wrapper<F> f) noexcept {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+    }
+    detail::function_construct<FD>(_storage, std::move(f));
+    _manage = &detail::function_manage<FD>;
+    _invoke = &detail::function_invoke<FD, R, ArgTypes...>;
+    return *this;
+  }
+
+  ~function() {
+    if (_manage != nullptr) {
+      _manage(_storage, detail::function_action::destroy, nullptr);
+    }
+  }
+
+  // [func.wrap.func.mod], function modifiers
+  void swap(function& other) noexcept {
+    detail::function_storage temp_storage;
+    if (_manage != nullptr) {
+      _manage(temp_storage, detail::function_action::move, &_storage);
+    }
+    if (other._manage != nullptr) {
+      other._manage(_storage, detail::function_action::move, &other._storage);
+    }
+    if (_manage != nullptr) {
+      _manage(other._storage, detail::function_action::move, &temp_storage);
+    }
+    std::swap(_manage, other._manage);
+    std::swap(_invoke, other._invoke);
+  }
+
+  // [func.wrap.func.cap], function capacity
+  explicit operator bool() const noexcept { return _manage != nullptr; }
+
+  // [func.wrap.func.inv], function invocation
+  R operator()(ArgTypes... args) const {
+    return _invoke(_storage, std::forward<ArgTypes>(args)...);
+  }
+
+  // [func.wrap.func.targ], function target access
+#if SLB_HAS_CXX98_RTTI
+  std::type_info const& target_type() const noexcept {
+    if (_manage != nullptr) {
+      return *static_cast<std::type_info const*>(
+          _manage(_storage, detail::function_action::type_id, nullptr));
+    }
+    return typeid(void);
+  }
+#endif
+
+  template <typename T>
+  T* target() noexcept {
+    if (_manage == &detail::function_manage<T>) {
+      return static_cast<T*>(
+          _manage(_storage, detail::function_action::get, nullptr));
+    }
+    return nullptr;
+  }
+
+  template <typename T>
+  T const* target() const noexcept {
+    if (_manage == &detail::function_manage<T>) {
+      return static_cast<T const*>(
+          _manage(_storage, detail::function_action::get, nullptr));
+    }
+    return nullptr;
+  }
+
+private:
+  detail::function_storage mutable _storage;
+  void* (*_manage)(detail::function_storage&,
+                   detail::function_action,
+                   detail::function_storage*);
+  R (*_invoke)(detail::function_storage&, ArgTypes&&...);
+};
+
+#if SLB_HAS_CXX17_DEDUCTION_GUIDES
+namespace detail {
+template <typename F>
+struct function_deduced_type_noexcept {};
+
+template <typename F>
+struct function_deduced_type : function_deduced_type_noexcept<F> {};
+
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) const noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) volatile noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) const volatile noexcept> {
+  using type = R(A...);
+};
+
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) & noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) const& noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) volatile& noexcept> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type_noexcept<R (G::*)(A...) const volatile& noexcept> {
+  using type = R(A...);
+};
+
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...)> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) const> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) volatile> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) const volatile> {
+  using type = R(A...);
+};
+
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...)&> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) const&> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) volatile&> {
+  using type = R(A...);
+};
+template <typename R, typename G, typename... A>
+struct function_deduced_type<R (G::*)(A...) const volatile&> {
+  using type = R(A...);
+};
+} // namespace detail
+
+template <typename R, typename... ArgTypes>
+function(R (*)(ArgTypes...))->function<R(ArgTypes...)>;
+
+template <typename F>
+function(F)
+    ->function<
+        typename detail::function_deduced_type<decltype(&F::operator())>::type>;
+#endif
+
+// [func.wrap.func.nullptr], Null pointer comparisons
+template <typename R, typename... ArgTypes>
+bool operator==(function<R(ArgTypes...)> const& f, std::nullptr_t) noexcept {
+  return !f;
+}
+
+template <typename R, typename... ArgTypes>
+bool operator==(std::nullptr_t, function<R(ArgTypes...)> const& f) noexcept {
+  return !f;
+}
+
+template <typename R, typename... ArgTypes>
+bool operator!=(function<R(ArgTypes...)> const& f, std::nullptr_t) noexcept {
+  return !!f;
+}
+
+template <typename R, typename... ArgTypes>
+bool operator!=(std::nullptr_t, function<R(ArgTypes...)> const& f) noexcept {
+  return !!f;
+}
+
+// [func.wrap.func.alg], specialized algorithms
+template <typename R, typename... ArgTypes>
+void swap(function<R(ArgTypes...)>& f1, function<R(ArgTypes...)>& f2) noexcept {
+  f1.swap(f2);
+}
 
 // [func.bind], function object binders
 
